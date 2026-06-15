@@ -85,7 +85,7 @@ def get_litellm_config():
             "LiteLLM API key not found. Set EVAL_LLM_API_KEY or LLM_API_KEY env var."
         )
 
-    api_base = os.getenv("EVAL_LLM_BASE_URL", "")
+    api_base = os.getenv("EVAL_LLM_BASE_URL") or os.getenv("LLM_BASE_URL", "")
     return api_key, api_base
 
 
@@ -383,14 +383,43 @@ class AsyncLiteLLMClient(AsyncLLMClient):
                 # Rate limiting delay
                 await asyncio.sleep(self.config.request_delay)
 
-                # Parse JSON response
-                content = response.choices[0].message.content
-                return json.loads(content)
+                return self._parse_json_response(response.choices[0].message.content)
 
             except Exception as e:
                 self.error_count += 1
                 self.logger.error(f"LiteLLM API error: {e}")
                 raise
+
+    def _parse_json_response(self, content: Optional[str]) -> Dict:
+        """Parse JSON from provider output with fallbacks for proxy quirks."""
+        text = (content or "").strip()
+        if not text:
+            raise ValueError("Evaluator model returned empty content")
+
+        # Some proxies wrap the JSON payload in markdown fences.
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text).strip()
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            # Fallback for providers that prepend commentary before the JSON object.
+            decoder = json.JSONDecoder()
+            for idx, ch in enumerate(text):
+                if ch != "{":
+                    continue
+                try:
+                    parsed, _ = decoder.raw_decode(text[idx:])
+                    if isinstance(parsed, dict):
+                        return parsed
+                except json.JSONDecodeError:
+                    continue
+
+            preview = text[:300].replace("\n", "\\n")
+            raise ValueError(
+                f"Evaluator model returned non-JSON content: {preview!r}"
+            ) from exc
 
     def get_stats(self) -> Dict[str, int]:
         """Get request statistics"""
@@ -419,7 +448,7 @@ class CoverageEvaluator:
         """Generate prompt for evaluating a single claim"""
         return f"""You are evaluating how well a model's response addresses a specific expert-defined claim.
 SCORING CRITERIA:
-- fulfilled: Claim is completely and accurately addressed. The response covers all key details.
+- fully_fulfilled: Claim is completely and accurately addressed. The response covers all key details.
 - partially_fulfilled: Claim is partially addressed. The response covers some but not all key details.
 - not_fulfilled: Claim is not addressed. The response does not include any key details.
 NUMERICAL COMPARISON GUIDELINES:
@@ -446,7 +475,14 @@ INSTRUCTIONS:
 4. Provide specific justification referencing what was/wasn't covered
    - When numbers differ slightly, note if they're within acceptable range
 5. Provide a confidence level (0.0-1.0) for your assessment
-Be rigorous but fair in your assessment. Focus on whether the response conveys the same information as the claim, not on exact numerical precision unless precision is critical to the claim's meaning."""
+Be rigorous but fair in your assessment. Focus on whether the response conveys the same information as the claim, not on exact numerical precision unless precision is critical to the claim's meaning.
+
+OUTPUT FORMAT (CRITICAL):
+- Output ONLY a single valid JSON object, nothing else.
+- Do not include numbered lists, markdown headers, bold (**), code fences, or any commentary.
+- Do not prepend or append explanatory text. The first character MUST be '{{' and the last character MUST be '}}'.
+- Schema: {{"coverage_outcome": "fully_fulfilled" | "partially_fulfilled" | "not_fulfilled", "justification": "<one short sentence>"}}
+- Example valid output: {{"coverage_outcome": "fully_fulfilled", "justification": "The response provides the exact numerical value requested by the claim."}}"""
 
     async def evaluate_single_claim(self, claim: str, response: str) -> Dict[str, Any]:
         """Evaluate a single claim against the response"""
@@ -478,9 +514,15 @@ Be rigorous but fair in your assessment. Focus on whether the response conveys t
                 "confidence": 1.0,
             }
 
-        # Define coverage outcome to score mapping
+        # Define coverage outcome to score mapping.
+        # Keys must match the enum produced by the evaluator (see
+        # _get_single_claim_evaluation_prompt + get_single_claim_evaluation_schema).
+        # Accept both spellings ('fulfilled' for backward compat with earlier prompt
+        # versions, 'fully_fulfilled' for the current schema-aligned spelling) so a
+        # prompt-vs-schema desync does not silently zero out every claim.
         coverage_to_score = {
             "fulfilled": 1.0,
+            "fully_fulfilled": 1.0,
             "partially_fulfilled": 0.5,
             "not_fulfilled": 0.0,
         }

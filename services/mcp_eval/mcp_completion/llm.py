@@ -135,7 +135,7 @@ def _transform_tool_calls(tools: List[Dict[str, Any]]) -> List[ToolCallSchema]:
             type="function",
             function={
                 "name": tool["name"],
-                "description": tool["description"],
+                "description": tool.get("description") or tool["name"],
                 "parameters": tool.get("input_schema", {}),
                 "strict": False,
             },
